@@ -1,0 +1,65 @@
+import web
+#from token import populate
+import datetime
+from LitevirtAPI.utils.utils import uuidgen
+from LitevirtAPI.auth import token
+import copy
+#set log
+import LitevirtAPI.log as logging
+log = logging.getLogger("root")
+#read config
+
+
+ERROR_WEB = "/none/"
+DEAFUALT_TIME = datetime.datetime(2000, 1,1)
+
+#clear database
+token.save_tokenlist({})
+
+def gotoerror(info):
+    web.ctx.path = ERROR_WEB
+    web.ctx.method = "GET"
+    web.ctx.status = "401"
+    log.error(info)
+
+
+def enterhook():
+
+    #real ip into web.ctx.ip
+    if web.ctx.ip == "127.0.0.1":
+        real_ip = web.ctx.env.get('HTTP_X_FORWARDED_FOR',"unknow")
+        real_ip = real_ip.replace("::ffff:","")
+        web.ctx.ip = real_ip
+    
+    #firsh login 
+    if (web.ctx.path == "/litevirt-api/tokens" and web.ctx.method == "POST"):
+        return
+
+    #check usr
+    token_temp = web.ctx.env.get('HTTP_X_AUTH_TOKEN', None)
+    #print "enterhook",token
+    if token.check_token(token_temp):
+        pass
+    else:
+        gotoerror("torkn invaild")   
+
+def exithook():
+    
+    if (web.ctx.status == "400"):
+        log.info("exithook status 400")
+        return
+
+    token_temp = web.ctx.env.get('HTTP_X_AUTH_TOKEN', None)
+
+    #logout
+    if (web.ctx.path == "/litevirt-api/tokens" and web.ctx.method == "DELETE"):
+        token.del_token(token_temp)
+        return
+
+    #firsh login create token
+    if (web.ctx.path == "/litevirt-api/tokens" and web.ctx.method == "POST"):
+
+        token_temp = token.get_token()
+        web.ctx.headers.append(('X-Auth-Token', token_temp))
+        #log.debug("user login %s"% tokenlist[tokens])
+
