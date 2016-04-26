@@ -1,0 +1,296 @@
+from gevent import monkey; monkey.patch_all()
+from gevent.pywsgi import WSGIServer
+from LitevirtAPI.urlfilter import enterhook, exithook
+from LitevirtAPI.utils.daemon import Daemon
+from LitevirtAPI import urlhandler
+from LitevirtAPI.backend.storagehealthdaemon import StartScheduler
+from LitevirtAPI.cluster.cluster_scheduler import StartClusterScheduler
+from LitevirtAPI.object_model.task import Task
+import os
+import web
+
+try:
+    import simplejson as json
+except ImportError:
+    import json
+import mimerender
+import time
+import sys
+import LitevirtAPI.log as logging
+log = logging.getLogger("network")
+
+LOGSTD = "/tmp/log"
+CREATE="touch %s"%LOGSTD
+
+APIPATH = "/lib/python2.7/site-packages/LitevirtAPI"
+sys.path.append(APIPATH)
+
+#read config file
+import ConfigParser
+try:
+    config = ConfigParser.ConfigParser()
+    config.read("/etc/litevirt-api/litevirt-api.conf")
+    enable_filter = (config.get("filter", "filter") == "on")
+except:
+    enable_filter = False
+
+mimerender = mimerender.WebPyMimeRender()
+
+render_xml = lambda message: '<message>%s</message>'%message
+render_json = lambda **args: json.dumps(args)
+render_html = lambda message: '<html><body>%s</body></html>'%message
+render_txt = lambda message: message
+
+urls = (
+    '/litevirt-api/uploadfile', 'FileUpload',
+    '/litevirt-api/downloadfile', 'FileDownload',
+    '/api/', 'index',
+    '/none/', 'Empweb',
+
+    '/illegal', 'illegal',
+
+    #authentication
+    '/litevirt-api/tokens', 'urlhandler.UrlTokensHandler',
+    '/litevirt-api/user', 'urlhandler.host.UrlUserHandler',
+    '/litevirt-api/user/(.*)', 'urlhandler.host.UrlUserPutOrDelHandler',
+
+    #vms
+    '/litevirt-api/vms', 'urlhandler.UrlCreateVmHandler',
+    '/litevirt-api/vms/(.*)/action/clone', 'urlhandler.UrlCloneVmHandler',
+    '/litevirt-api/vms/action/import',  'urlhandler.UrlImportVmHandler',
+    '/litevirt-api/vms/action/importVApp', 'urlhandler.UrlImportVAppHandler',
+    '/litevirt-api/vms/(.*)/action/start', 'urlhandler.UrlStartVmHandler',
+    '/litevirt-api/vms/(.*)/action/stop', 'urlhandler.UrlStopVmHandler',
+    '/litevirt-api/vms/(.*)/action/reboot', 'urlhandler.UrlRebootVmHandler',
+    '/litevirt-api/vms/(.*)/action/hibernate', 'urlhandler.UrlHibernateVmHandler',
+    '/litevirt-api/vms/(.*)/action/wakeup', 'urlhandler.UrlWakeupVmHandler',
+    '/litevirt-api/vms/(.*)/action/suspend', 'urlhandler.UrlSuspendVmHandler',
+    '/litevirt-api/vms/(.*)/action/resume', 'urlhandler.UrlResumeVmHandler',
+    '/litevirt-api/vms/(.*)/action/migrate', 'urlhandler.UrlMigrateVmHandler',
+    '/litevirt-api/vms/(.*)/realtimeinfo', 'urlhandler.UrlVmRealtimeinfoHandler',
+    '/litevirt-api/vms/(.*)/action/attachDevice', 'urlhandler.UrlAttachDeviceHandler',
+    '/litevirt-api/vms/(.*)/action/detachDevice', 'urlhandler.UrlDetachDeviceHandler',
+    '/litevirt-api/vms/(.*)/action/createNic', 'urlhandler.UrlCreateNicHandler',
+    '/litevirt-api/vms/(.*)/action/deleteNic', 'urlhandler.UrlDeleteNicHandler',
+    '/litevirt-api/vms/(.*)/action/editNic', 'urlhandler.UrlEditNicHandler',
+    '/litevirt-api/vms/(.*)/action/export', 'urlhandler.UrlExportVmHandler',
+    '/litevirt-api/vms/(.*)/action/createDisk', 'urlhandler.UrlCreateDiskHandler',
+    '/litevirt-api/vms/(.*)/action/deleteDisk', 'urlhandler.UrlDeleteDiskHandler',
+    '/litevirt-api/vms/(.*)', 'urlhandler.UrlVmOptionHandler',
+    '/litevirt-api/passthroughs', 'urlhandler.UrlListPSHandler',
+
+    #network
+    '/litevirt-api/uplinkports', 'urlhandler.UrlListUplinkPortHandler',
+    '/litevirt-api/uplinkports/(.*)/statistics', 'urlhandler.UrlUplinkPortStatisticsHandler',
+    '/litevirt-api/uplinkports/(.*)', 'urlhandler.UrlShowUplinkPortHandler',
+    '/litevirt-api/uplinkportaggrs', 'urlhandler.UrlListUplinkPortAggrHandler',
+    '/litevirt-api/uplinkportaggrs/(.*)/statistics', 'urlhandler.UrlUplinkPortAggrStatisticsHandler',
+    '/litevirt-api/uplinkportaggrs/(.*)', 'urlhandler.UrlShowUplinkPortAggrHandler',
+    '/litevirt-api/vswitches/(.*)/action/detach', 'urlhandler.UrlDetachVSwtichesHandler',
+    '/litevirt-api/vswitches/(.*)/action/attach', 'urlhandler.UrlAttachVSwtichesHandler',
+    '/litevirt-api/vswitches/(.*)/sysifaces', 'urlhandler.UrlCreateSysteminterfaceHandler',
+    '/litevirt-api/vswitches/(.*)/sysifaces/(.*)/ip', 'urlhandler.UrlSysteminterfaceIpHandler',
+    '/litevirt-api/vswitches/(.*)/sysifaces/(.*)/qos', 'urlhandler.UrlSysteminterfaceQosHandler',
+    '/litevirt-api/vswitches/(.*)/sysifaces/(.*)/vlan', 'urlhandler.UrlSysteminterfaceVlanHandler',
+    '/litevirt-api/vswitches/(.*)/sysifaces/(.*)/statistics', 'urlhandler.UrlSysteminterfaceStatisticsHandler',
+    '/litevirt-api/vswitches/(.*)/sysifaces/(.*)', 'urlhandler.UrlDeleteSysteminterfaceHandler',
+    '/litevirt-api/vswitches/(.*)/portgroups', 'urlhandler.UrlCreatePortgroupHandler',
+    '/litevirt-api/vswitches/(.*)/portgroups/(.*)/qos', 'urlhandler.UrlPortgroupQosHandler',
+    '/litevirt-api/vswitches/(.*)/portgroups/(.*)/vlan', 'urlhandler.UrlPortgroupVlanHandler',
+    '/litevirt-api/vswitches/(.*)/portgroups/(.*)', 'urlhandler.UrlDeletePortgroupHandler',
+    '/litevirt-api/vswitches/(.*)/uplinkports', 'urlhandler.UrlUpdateUplinkportsHandler',
+    '/litevirt-api/vswitches/(.*)', 'urlhandler.UrlVSwitchHandler',
+    '/litevirt-api/vswitches', 'urlhandler.UrlVSwitchesHandler',
+
+
+    #task
+    '/litevirt-api/tasks', 'urlhandler.task.UrlListTaskHandler',
+    '/litevirt-api/tasks/(.*)', 'urlhandler.task.UrlShowTaskHandler',
+
+    #alarm
+    '/litevirt-api/alarms', 'urlhandler.UrlListAlarmHandler',
+    '/litevirt-api/alarms/(.*)', 'urlhandler.UrlShowAlarmHandler',
+
+    #event
+    '/litevirt-api/events', 'urlhandler.UrlListEventHandler',
+    '/litevirt-api/events/(.*)', 'urlhandler.UrlShowEventHandler',
+
+    #host
+    '/litevirt-api/host/queryNodeInfo', 'urlhandler.UrlNodeInfoHandler',
+    '/litevirt-api/host', 'urlhandler.UrlHostHandler',
+    '/litevirt-api/host/action/register', 'urlhandler.UrlRegisterHostHandler',
+    '/litevirt-api/host/action/deregister', 'urlhandler.UrlUnregisterHostHandler',
+    '/litevirt-api/host/action/reboot', 'urlhandler.UrlRebootHostHandler',
+    '/litevirt-api/host/action/shutdown', 'urlhandler.UrlShutdownHostHandler',
+    '/litevirt-api/host/hardware_information', 'urlhandler.UrlHostInfoHandler',
+    '/litevirt-api/host/statistics', 'urlhandler.UrlHostMonitorHandler',
+    '/litevirt-api/host/action/rescan_storage_device', 'urlhandler.UrlRescanDevHandler',
+    '/litevirt-api/host/pnics', 'urlhandler.UrlListPnicHandler',
+    '/litevirt-api/host/pnicport/(.*)/statistics', 'urlhandler.UrlPnicportStatisticsHandler',
+    '/litevirt-api/host/pnicport/(.*)', 'urlhandler.UrlPnicportHandler',
+
+    #storage
+
+    #storage->snapshot
+    '/litevirt-api/datastores/(.*)/volumegroups/(.*)/volumes/(.*)/action/snapshot', 'urlhandler.UrlCreateSnapshotHandler',
+    '/litevirt-api/datastores/(.*)/volumegroups/(.*)/volumes/(.*)/snapshots', 'urlhandler.UrlSnapshotsHandler',
+    '/litevirt-api/snapshots/(.*)', 'urlhandler.UrlSnapshotHandler',
+
+     #storage->volume
+    '/litevirt-api/datastores/(.*)/volumegroups/(.*)/volumes', 'urlhandler.UrlVolumesHandler',
+    '/litevirt-api/datastores/(.*)/volumegroups/(.*)/volumes/(.*)/statistics', 'urlhandler.UrlVolumesStatisticsHandler',
+    '/litevirt-api/datastores/(.*)/volumegroups/(.*)/volumes/(.*)/action/clone', 'urlhandler.UrlCloneVolumeHandler',
+    '/litevirt-api/datastores/(.*)/volumegroups/(.*)/volumes/(.*)', 'urlhandler.UrlVolumeHandler',
+
+    #volumegroup
+    '/litevirt-api/datastores/(.*)/volumegroups/(.*)/action/move', 'urlhandler.UrlMoveVolumegroupHandler',
+    '/litevirt-api/datastores/(.*)/volumegroups/(.*)', 'urlhandler.UrlVolumegroupOptionHandler',
+    '/litevirt-api/datastores/(.*)/volumegroups', 'urlhandler.UrlVolumegroupHandler',
+
+    #datastore
+    '/litevirt-api/datastores', 'urlhandler.UrlDatastoresHandler',
+    '/litevirt-api/datastores/(.*)/statistics', 'urlhandler.UrlShowDatastoreHandler',
+    '/litevirt-api/datastores/(.*)', 'urlhandler.UrlDatastoreOptionHandler',
+    
+    '/litevirt-api/storageunits', 'urlhandler.UrlStorageDeviceHandler',
+    
+    #storageadapters
+    '/litevirt-api/storageadapters/rescan', 'urlhandler.UrlAllStorageAdapterRescanHandler',
+    '/litevirt-api/storageadapters/(.*)/rescan', 'urlhandler.UrlStorageAdapterRescanHandler',
+    '/litevirt-api/storageadapters/(.*)/storageunits', 'urlhandler.UrlStorageAdapterStorageUnitHandler',
+    '/litevirt-api/storageadapters/(.*)/propertys', 'urlhandler.UrlStorageAdapterPropertysHandler',
+    '/litevirt-api/storageadapters/(.*)/statictargets', 'urlhandler.UrlStorageAadapterStatictargetsHandler',
+    '/litevirt-api/storageadapters/(.*)/delstatictargets', 'urlhandler.UrlStorageAadapterStatictargetsDelHandler',
+    '/litevirt-api/storageadapters/(.*)/sendtargets', 'urlhandler.UrlStorageAadapterSendtargetsHandler',
+    '/litevirt-api/storageadapters/(.*)/delsendtargets', 'urlhandler.UrlStorageAadapterSendtargetsDelHandler',
+    '/litevirt-api/storageadapters/(.*)/sysifaces', 'urlhandler.UrlStorageAadapterSysifacesHandler',
+    '/litevirt-api/storageadapters/(.*)', 'urlhandler.UrlStroageAdapterHandler',
+    
+    '/litevirt-api/storageadapters', "urlhandler.UrlStorageAdaptersHandler",
+
+    #monitor
+    '/litevirt-api/host/objectmetric-data','urlhandler.host.UrlCollectdHostMonitor',
+    '/litevirt-api/vms/(.*)/objectmetric-data','urlhandler.host.UrlCollectdVMMonitor',
+    
+    #cluster
+    '/litevirt-api/cluster/configinfo', 'urlhandler.cluster.UrlClusterConfigHandler'
+)
+
+class Empweb:
+    def GET(self):
+       return '''{"description":"error check your url token,and json"}'''
+
+
+
+class index:
+    @mimerender(
+        default = 'html',
+        html = render_html,
+        xml = render_xml,
+        json = render_json,
+        txt = render_txt
+    )
+
+    def GET(self):
+        #time.sleep(10)
+        return {'message': 'Hello, world!'}
+
+class illegal:
+    def GET(self):
+        web.ctx.status = "403 Forbidden"
+        return "403 Forbidden"
+
+def filter_request():
+    if web.ctx.ip != "127.0.0.1" and web.ctx.path != "/illegal":
+        raise web.redirect("/illegal")
+
+def init():
+    Task.server_restart()
+
+
+class LitevirtApiDaemon(Daemon):
+
+    def run(self):
+
+        # Create storage monitor thread
+        init()
+        StartScheduler()
+        
+        # Start cluster scheduler thread
+        StartClusterScheduler()
+
+        # key = "/etc/ssl/litevirt/litevirt-api.key"
+        # crt = "/etc/ssl/litevirt/litevirt-api.crt"
+        app = web.application(urls, globals())
+        if enable_filter:
+            app.add_processor(web.loadhook(enterhook))
+            app.add_processor(web.unloadhook(exithook))
+
+#        app.add_processor(web.loadhook(filter_request))
+
+        application = app.wsgifunc()
+        server = WSGIServer(('', 8088),
+                         application
+#                        keyfile = key,
+#                        certfile = crt
+                        )
+        server.serve_forever()
+
+class FileUpload:
+    def POST(self):
+        try:
+            file = web.input()
+            fileName = file["resumableFilename"]
+            chunkSize = file["resumableChunkSize"]
+            chunkNumber = file["resumableChunkNumber"]
+            datastoreId = file["datastoreId"]
+            content = file["file"]
+            if fileName is None or chunkSize is None or chunkNumber is None or datastoreId is None:
+                return "403 invalid request"
+            position = int(chunkSize) * (int(chunkNumber)-1)
+
+            fileDir = "/data/" + datastoreId
+            if not os.path.exists(fileDir):
+                return "403 datastore not exists"
+
+            fileDir += "/ovftemplate/"
+            if not os.path.exists(fileDir):
+                os.mkdir(fileDir, 755)
+
+            filePath = fileDir + fileName
+            fp = open(filePath, "a+")
+            fp.seek(position)
+            fp.write(content)
+        except:
+            return "403 system error"
+        finally:
+            fp.close()
+
+class FileDownload:
+
+    def GET(self):
+        web.ctx.headers.append(("Content-Disposition","attachment;filename = abc.txt"))
+        fp = open ("/data/"+"OVFtest-disk1.vmdk", "r")
+        return fp.read()
+
+if __name__ == "__main__":
+        daemon = LitevirtApiDaemon('/tmp/daemon-litevirt.pid', stdin=LOGSTD, stdout=LOGSTD, stderr=LOGSTD)
+        if len(sys.argv) == 2:
+                if 'start' == sys.argv[1]:
+                        os.system(CREATE)
+                        daemon.start()
+                elif 'stop' == sys.argv[1]:
+                        daemon.stop()
+                        if os.path.exists(LOGSTD):
+                            os.remove(LOGSTD)
+                elif 'restart' == sys.argv[1]:
+                        daemon.restart()
+                else:
+                        print "Unknown command"
+                        sys.exit(2)
+                sys.exit(0)
+        else:
+
+                print "usage: %s start|stop|restart" % sys.argv[0]
+
+                sys.exit(2)
