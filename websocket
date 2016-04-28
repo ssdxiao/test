@@ -1,0 +1,122 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from functools import partial
+import threading
+import tornado.httpserver
+import tornado.websocket
+import tornado.ioloop
+import tornado.web
+import redis
+import os
+from litevirt_websocket.daemon import Daemon
+import sys
+import time
+from datetime import datetime
+from litevirt_websocket.log import logger
+try:
+    import simplejson as json
+except ImportError:
+    import json
+
+LISTENERS = []
+BACKUP_KEY = "backup"
+BACKUP_SIZE = 1000
+RETRY_PUSH = "retry_push"
+
+r = redis.Redis()
+
+def datetime2float(datetime):
+    return float(time.mktime(datetime.timetuple()))
+
+def backup_message(message):
+    if r.zcard(BACKUP_KEY) > BACKUP_SIZE :
+        r.zremrangebyrank(BACKUP_KEY, 0, 1)
+    r.zadd(BACKUP_KEY, json.dumps(message), message["timestamp"])
+
+def get_messages(last_timestamp):
+    now_timestamp = datetime2float(datetime.now())
+    return r.zrangebyscore(BACKUP_KEY, last_timestamp, now_timestamp)
+
+
+def redis_listener():
+    ps = r.pubsub()
+    ps.subscribe('realtime')
+    io_loop = tornado.ioloop.IOLoop.instance()
+    for message in ps.listen():
+        info=message["data"]
+        logger.info(info)
+        if message["type"] == "message":
+            msg=json.loads(info)
+            msg["timestamp"] = datetime2float(datetime.now())
+            logger.info(msg)
+            backup_message(msg)
+            for element in LISTENERS:
+                io_loop.add_callback(partial(element.on_message, json.dumps(msg)))
+
+class RealtimeHandler(tornado.websocket.WebSocketHandler):
+
+    def open(self):
+        LISTENERS.append(self)
+
+    def on_message(self, message):
+        request = json.loads(message)
+        logger.info("Receive msg:%s" % message)
+        if request.get("command") == RETRY_PUSH:
+            msgs = get_messages(request.get("last_timestamp"))
+            if len(msgs) > 0:
+                [self.write_message(msg) for msg in msgs]
+            else :
+                discard_info = {"type" : "RetryDiscard"}
+                self.write_message(discard_info)
+            return
+        self.write_message(message)
+
+    def on_close(self):
+        LISTENERS.remove(self)
+
+
+settings = {
+    'auto_reload': True,
+    }
+
+application = tornado.web.Application(
+    [(r'/litevirt-websocket/realtime/',RealtimeHandler),],
+    **settings)
+
+class LitevirtWebsocketDaemon(Daemon):
+
+    def run(self):
+        threading.Thread(target=redis_listener).start()
+        #usage from http://stackoverflow.com/questions/8045698/https-python-client
+        #openssl genrsa -out privatekey.pem 2048
+        #openssl req -new -key privatekey.pem -out certrequest.csr
+        #openssl x509 -req -in certrequest.csr -signkey privatekey.pem -out certificate.pem
+        http_server = tornado.httpserver.HTTPServer(
+            application,
+#            ssl_options={
+#                "certfile": os.path.join("./", "certificate.pem"),
+#                "keyfile": os.path.join("./", "privatekey.pem"),
+#                }
+        )
+        http_server.listen(8888)
+        tornado.ioloop.IOLoop.instance().start()
+
+
+if __name__ == "__main__":
+    daemon = LitevirtWebsocketDaemon('/tmp/litevirt-websocket.pid')
+    if len(sys.argv) == 2:
+        if 'start' == sys.argv[1]:
+            daemon.start()
+        elif 'stop' == sys.argv[1]:
+            daemon.stop()
+        elif 'restart' == sys.argv[1]:
+            daemon.restart()
+        else:
+            print "Unknown command"
+            sys.exit(2)
+        sys.exit(0)
+    else:
+        print "usage: %s start|stop|restart" % sys.argv[0]
+        sys.exit(2)
+
