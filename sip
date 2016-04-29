@@ -1,3 +1,5 @@
+http://www.asterisk.org/
+
 使用chrome录音
 http://www.cnblogs.com/blqw/p/3782420.html
 
