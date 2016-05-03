@@ -14,3 +14,10 @@ voip 使用指导
 http://blog.sina.com.cn/s/blog_53ed87c10101iloi.html
 
 X-lite
+
+
+
+将Asterisk联入真实世界(PSTN)需要了解的
+http://bbs.voip88.com/thread-302-1-1.html
+通信社区
+http://bbs.voip88.com/
